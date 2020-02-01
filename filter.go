@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io/ioutil"
 	"os"
-	"strings"
 
 	"github.com/BurntSushi/toml"
 	"github.com/sirupsen/logrus"
@@ -21,45 +20,34 @@ type filterfile struct {
 // filter defines a filter object.
 type filter struct {
 	Query             string
-	QueryOr           []string
+	NegatedQuery      string
 	Archive           bool
+	ArchiveUnlessToMe bool
 	Read              bool
 	Delete            bool
-	ToMe              bool
-	ArchiveUnlessToMe bool
-	Label             string
+	Important         bool
+	Star              bool
+	Spam              bool
+	Labels            []string
 	ForwardTo         string
 }
 
 func (f filter) toGmailFilters(labels *labelMap) ([]gmail.Filter, error) {
-	// Convert the filter into a gmail filters.
-	if len(f.Query) > 0 && len(f.QueryOr) > 0 {
-		return nil, errors.New("cannot have both a query and a queryOr")
+	// Convert the filter into a gmail filter.
+
+	if len(f.Query) < 1 && len(f.NegatedQuery) < 1 {
+		return nil, errors.New("Query and NegatedQuery cannot both be empty")
 	}
 
-	if len(f.QueryOr) > 0 {
-		// Create the OR query.
-		f.Query = strings.Join(f.QueryOr, " OR ")
-	}
-
-	if len(f.Query) < 1 {
-		return nil, errors.New("query or queryOr cannot be empty")
+	if f.Archive && f.ArchiveUnlessToMe {
+		return nil, errors.New("Archive and ArchiveUnlessToMe cannot both be true")
 	}
 
 	action := gmail.FilterAction{
 		AddLabelIds:    []string{},
 		RemoveLabelIds: []string{},
 	}
-	if len(f.Label) > 0 {
-		// Create the label if it does not exist.
-		labelID, err := labels.createLabelIfDoesNotExist(f.Label)
-		if err != nil {
-			return nil, err
-		}
-		action.AddLabelIds = append(action.AddLabelIds, labelID)
-	}
 
-	action.RemoveLabelIds = []string{}
 	if f.Archive && !f.ArchiveUnlessToMe {
 		action.RemoveLabelIds = append(action.RemoveLabelIds, "INBOX")
 	}
@@ -72,14 +60,28 @@ func (f filter) toGmailFilters(labels *labelMap) ([]gmail.Filter, error) {
 		action.AddLabelIds = append(action.AddLabelIds, "TRASH")
 	}
 
+	if f.Important {
+		action.AddLabelIds = append(action.AddLabelIds, "IMPORTANT")
+	}
+
+	if f.Star {
+		action.AddLabelIds = append(action.AddLabelIds, "STARRED")
+	}
+
+	if f.Spam {
+		action.AddLabelIds = append(action.AddLabelIds, "SPAM")
+	}
+
 	if len(f.ForwardTo) > 0 {
 		action.Forward = f.ForwardTo
 	}
 
 	criteria := gmail.FilterCriteria{
-		Query: f.Query,
+		Query:        f.Query,
+		NegatedQuery: f.NegatedQuery,
 	}
-	if f.ToMe || f.ArchiveUnlessToMe {
+
+	if f.ArchiveUnlessToMe {
 		criteria.To = "me"
 	}
 
@@ -87,9 +89,8 @@ func (f filter) toGmailFilters(labels *labelMap) ([]gmail.Filter, error) {
 		Action:   &action,
 		Criteria: &criteria,
 	}
-	filters := []gmail.Filter{
-		filter,
-	}
+
+	filters := []gmail.Filter{}
 
 	// If we need to archive unless to them, then add the additional filter.
 	if f.ArchiveUnlessToMe {
@@ -97,8 +98,8 @@ func (f filter) toGmailFilters(labels *labelMap) ([]gmail.Filter, error) {
 		archiveIfNotToMeFilter := filter
 		archiveIfNotToMeFilter.Criteria = &gmail.FilterCriteria{
 			Query:        f.Query,
-			To:           "",
-			NegatedQuery: "to:me",
+			To:           "(-me)",
+			NegatedQuery: f.NegatedQuery,
 		}
 
 		// Copy the action.
@@ -109,6 +110,47 @@ func (f filter) toGmailFilters(labels *labelMap) ([]gmail.Filter, error) {
 
 		// Append the extra filter.
 		filters = append(filters, archiveIfNotToMeFilter)
+	}
+
+	if len(f.Labels) > 1 {
+		// Create a rule per label with only the query criteria
+		for _, label := range f.Labels {
+			labelID, err := labels.createLabelIfDoesNotExist(label)
+			if err != nil {
+				return nil, err
+			}
+
+			// We can only add a single user label per filter, so clone and
+			// create a new filter and action per label
+			labelAction := gmail.FilterAction{
+				AddLabelIds: []string{
+					labelID,
+				},
+			}
+
+			labelCriteria := gmail.FilterCriteria{
+				Query:        f.Query,
+				NegatedQuery: f.NegatedQuery,
+			}
+
+			labelFilter := gmail.Filter{
+				Action:   &labelAction,
+				Criteria: &labelCriteria,
+			}
+
+			filters = append(filters, labelFilter)
+		}
+	} else if len(f.Labels) == 1 {
+		labelID, err := labels.createLabelIfDoesNotExist(f.Labels[0])
+		if err != nil {
+			return nil, err
+		}
+
+		action.AddLabelIds = append(action.AddLabelIds, labelID)
+	}
+
+	if len(action.AddLabelIds) > 0 || len(action.RemoveLabelIds) > 0 {
+		filters = append(filters, filter)
 	}
 
 	return filters, nil
@@ -159,19 +201,29 @@ func exportExistingFilters(file string) error {
 
 	var ff filterfile
 	for _, f := range filters {
-		// We could get duplicate filters, so it's best to remove them.
-		existingFilter := findExistingFilter(ff.Filter, f.Query)
+		existingFilter := findExistingFilter(&ff.Filter, f)
 
-		// Since we can't return nil on a struct or compary it to something empty,
+		// Since we can't return nil on a struct or compare it to something empty,
 		// check if the query exists. If not then consider it not found.
-		if existingFilter.Query != "" {
-			// Duplicate filters can only exist if the ArchiveUnlessToMe is set.
-			// So we can simply reset everything and just set the ArchiveUnlessToMe flag to true.
-			existingFilter.Archive = false
-			existingFilter.Delete = false
-			existingFilter.ToMe = false
-			existingFilter.ArchiveUnlessToMe = true
+		if existingFilter.Query != "" || existingFilter.NegatedQuery != "" {
+			if len(f.Labels) > 0 {
+				existingFilter.Labels = append(existingFilter.Labels, f.Labels...)
+			}
+
+			if f.ArchiveUnlessToMe {
+				existingFilter.ArchiveUnlessToMe = true
+			}
+
+			logrus.WithFields(logrus.Fields{
+				"Query":          fmt.Sprintf("%#v", f.Query),
+				"IncomingLabels": fmt.Sprintf("%#v", f.Labels),
+				"UpdatedLabels":  fmt.Sprintf("%#v", existingFilter.Labels),
+			}).Debug("existing Filter update")
 		} else {
+			logrus.WithFields(logrus.Fields{
+				"Labels": fmt.Sprintf("%#v", f.Labels),
+			}).Debug("new exported filter")
+
 			ff.Filter = append(ff.Filter, f)
 		}
 	}
@@ -209,39 +261,51 @@ func getExistingFilters() ([]filter, error) {
 	}
 
 	var filters []filter
-
+	fmt.Println(len(gmailFilters.Filter))
 	for _, gmailFilter := range gmailFilters.Filter {
-		var f filter
+		f := filter{
+			Labels: []string{},
+		}
+
+		fmt.Println(gmailFilter.Criteria.Query)
 
 		if gmailFilter.Criteria.Query > "" {
 			f.Query = gmailFilter.Criteria.Query
+		}
 
-			if gmailFilter.Criteria.To == "me" {
-				f.ToMe = true
-			}
+		if gmailFilter.Criteria.NegatedQuery > "" {
+			f.NegatedQuery = gmailFilter.Criteria.NegatedQuery
+		}
 
-			if len(gmailFilter.Action.AddLabelIds) > 0 {
-				labelID := gmailFilter.Action.AddLabelIds[0]
+		if len(gmailFilter.Action.AddLabelIds) > 0 {
+			for _, labelID := range gmailFilter.Action.AddLabelIds {
 				if labelID == "TRASH" {
 					f.Delete = true
+				} else if labelID == "IMPORTANT" {
+					f.Important = true
+				} else if labelID == "STARRED" {
+					f.Star = true
+				} else if labelID == "SPAM" {
+					f.Spam = true
 				} else {
 					labelName, ok := labels[labelID]
 					if ok {
-						f.Label = labelName
+						f.Labels = append(f.Labels, labelName)
 					}
 				}
 			}
+		}
 
-			if len(gmailFilter.Action.RemoveLabelIds) > 0 {
-				for _, labelID := range gmailFilter.Action.RemoveLabelIds {
-					if labelID == "UNREAD" {
-						f.Read = true
-					} else if labelID == "INBOX" {
-						if gmailFilter.Criteria.NegatedQuery == "to:me" {
-							f.ArchiveUnlessToMe = true
-						} else {
-							f.Archive = true
-						}
+		if len(gmailFilter.Action.RemoveLabelIds) > 0 {
+			for _, labelID := range gmailFilter.Action.RemoveLabelIds {
+				if labelID == "UNREAD" {
+					f.Read = true
+				} else if labelID == "INBOX" {
+					if gmailFilter.Criteria.To == "me" || gmailFilter.Criteria.To == "(-me)" {
+						f.ArchiveUnlessToMe = true
+						f.Archive = false
+					} else {
+						f.Archive = true
 					}
 				}
 			}
@@ -272,12 +336,14 @@ func writeFiltersToFile(ff filterfile, file string) error {
 	return nil
 }
 
-func findExistingFilter(filters []filter, query string) filter {
-	for _, f := range filters {
-		if f.Query == query {
-			return f
+func findExistingFilter(existingFilters *[]filter, compFilter filter) *filter {
+	for _, f := range *existingFilters {
+		if f.Query == compFilter.Query && f.NegatedQuery == compFilter.NegatedQuery {
+			return &f
 		}
 	}
 
-	return filter{}
+	return &filter{
+		Labels: []string{},
+	}
 }
